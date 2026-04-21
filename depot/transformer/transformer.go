@@ -584,7 +584,7 @@ func (t *transformer) StepsRunner(
 	}
 
 	if len(substeps) > 1 {
-		longLivedAction = steps.NewCodependent(substeps, false, false)
+		longLivedAction = steps.NewCodependent(substeps, false, true)
 	} else {
 		longLivedAction = action
 	}

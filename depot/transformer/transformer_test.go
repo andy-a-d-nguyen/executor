@@ -53,9 +53,37 @@ var _ = Describe("Transformer", func() {
 			runner                      ifrit.Runner
 			readinessChan               chan steps.ReadinessState
 			err                         error
+			makeProcess                 func(waitCh chan int) *gardenfakes.FakeProcess
+			makeProcessWithSignal       func(waitCh chan int) *gardenfakes.FakeProcess
 		)
 
 		BeforeEach(func() {
+			makeProcess = func(waitCh chan int) *gardenfakes.FakeProcess {
+				process := &gardenfakes.FakeProcess{}
+				process.WaitStub = func() (int, error) {
+					return <-waitCh, nil
+				}
+				return process
+			}
+
+			makeProcessWithSignal = func(waitCh chan int) *gardenfakes.FakeProcess {
+				process := &gardenfakes.FakeProcess{}
+				signalCh := make(chan struct{})
+				process.WaitStub = func() (int, error) {
+					select {
+					case r := <-waitCh:
+						return r, nil
+					case <-signalCh:
+						return 1, nil
+					}
+				}
+				process.SignalStub = func(garden.Signal) error {
+					close(signalCh)
+					return nil
+				}
+				return process
+			}
+
 			gardenContainer = &gardenfakes.FakeContainer{}
 			gardenContainer.HandleReturns("some-container-handle")
 			fakeMetronClient = &mfakes.FakeIngressClient{}
@@ -166,14 +194,16 @@ var _ = Describe("Transformer", func() {
 			It("returns a step encapsulating setup, post-setup, action, sidecars and monitor", func() {
 				setupReceived := make(chan struct{})
 				postSetupReceived := make(chan struct{})
-				gardenContainer.RunStub = func(processSpec garden.ProcessSpec, processIO garden.ProcessIO) (garden.Process, error) {
-					if processSpec.Path == "/setup/path" {
-						setupReceived <- struct{}{}
-					} else if processSpec.Path == "/post-setup/path" {
-						postSetupReceived <- struct{}{}
-					}
-					return &gardenfakes.FakeProcess{}, nil
+			gardenContainer.RunStub = func(processSpec garden.ProcessSpec, processIO garden.ProcessIO) (garden.Process, error) {
+				if processSpec.Path == "/setup/path" {
+					setupReceived <- struct{}{}
+				} else if processSpec.Path == "/post-setup/path" {
+					postSetupReceived <- struct{}{}
+				} else if processSpec.Path == "/action/path" || strings.HasPrefix(processSpec.Path, "/sidecar-action") {
+					return makeProcessWithSignal(make(chan int)), nil // block forever but handle signal
 				}
+				return &gardenfakes.FakeProcess{}, nil
+			}
 
 				runner, _, err := optimusPrime.StepsRunner(logger, container, gardenContainer, logStreamer, cfg)
 				Expect(err).NotTo(HaveOccurred())
@@ -249,6 +279,8 @@ var _ = Describe("Transformer", func() {
 			gardenContainer.RunStub = func(processSpec garden.ProcessSpec, processIO garden.ProcessIO) (garden.Process, error) {
 				if processSpec.Path == "/monitor/path" {
 					return monitorProcess, nil
+				} else if processSpec.Path == "/action/path" {
+					return makeProcessWithSignal(make(chan int)), nil // block forever but handle signal
 				}
 				return &gardenfakes.FakeProcess{}, nil
 			}
@@ -263,32 +295,6 @@ var _ = Describe("Transformer", func() {
 			clock.Increment(1 * time.Second)
 			Eventually(process.Ready()).Should(BeClosed())
 		})
-
-		makeProcess := func(waitCh chan int) *gardenfakes.FakeProcess {
-			process := &gardenfakes.FakeProcess{}
-			process.WaitStub = func() (int, error) {
-				return <-waitCh, nil
-			}
-			return process
-		}
-
-		makeProcessWithSignal := func(waitCh chan int) *gardenfakes.FakeProcess {
-			process := &gardenfakes.FakeProcess{}
-			signalCh := make(chan struct{})
-			process.WaitStub = func() (int, error) {
-				select {
-				case r := <-waitCh:
-					return r, nil
-				case <-signalCh:
-					return 1, nil
-				}
-			}
-			process.SignalStub = func(garden.Signal) error {
-				close(signalCh)
-				return nil
-			}
-			return process
-		}
 
 		Describe("container proxy", func() {
 			var (
@@ -2272,7 +2278,12 @@ var _ = Describe("Transformer", func() {
 			})
 
 			It("returns a codependent step for the action/monitor", func() {
-				gardenContainer.RunReturns(&gardenfakes.FakeProcess{}, nil)
+				gardenContainer.RunStub = func(processSpec garden.ProcessSpec, processIO garden.ProcessIO) (garden.Process, error) {
+					if processSpec.Path == "/action/path" {
+						return makeProcessWithSignal(make(chan int)), nil // block forever but handle signal
+					}
+					return &gardenfakes.FakeProcess{}, nil
+				}
 
 				runner, _, err := optimusPrime.StepsRunner(logger, container, gardenContainer, logStreamer, cfg)
 				Expect(err).NotTo(HaveOccurred())
